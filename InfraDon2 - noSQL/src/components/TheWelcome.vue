@@ -38,10 +38,46 @@ const editGameRelease = ref<number | null>(null)
 
 // Initialisation de la base de données
 const initDatabase = () => {
-  console.log('=> Connexion à la base de données')
-  const db = new PouchDB('http://admin:admin@localhost:5984/database-infradon')
-  storage.value = db
-  console.log('Connecté à la collection : ' + db.name)
+  const localDB = new PouchDB('database-infradon') // on se connecte et après on peut manipuler les objets
+  storage.value = localDB
+  console.log('Connecté à la collection: ' + localDB.name)
+
+  // 'http://admin:admin@localhost:5984/database-infradon'
+
+  localDB.replicate
+    .from('http://admin:admin@localhost:5984/database-infradon')
+    .on('complete', () => {
+      fetchData()
+    })
+    .on('error', (err) => {
+      console.error('Erreur lors de la réplication initiale:', err)
+    })
+  //push
+  localDB.replicate
+    .to('http://admin:admin@localhost:5984/database-infradon', {
+      live: true,
+      retry: true,
+    })
+    .on('change', (info) => {
+      console.log('↑ Changement envoyé vers distant:', info)
+    })
+    .on('error', (err) => {
+      console.error('✗ Erreur de réplication TO:', err)
+    })
+
+  //pull
+  localDB.replicate
+    .from('http://admin:admin@localhost:5984/database-infradon', {
+      live: true,
+      retry: true,
+    })
+    .on('change', (info) => {
+      console.log('Changement reçu du distant:', info)
+      fetchData()
+    })
+    .on('error', (err) => {
+      console.error('Erreur de réplication FROM:', err)
+    })
 }
 
 // Récupération des données
@@ -54,14 +90,14 @@ const fetchData = async () => {
       .filter((doc) => doc.biblio && doc.biblio.games)
     console.log('Données récupérées :', gamesData.value)
   } catch (error) {
-    console.error('Erreur lors de la récupération des données :', error)
+    console.error('Erreur lors de la récupération des données:', error)
   }
 }
 
 // Ajout d'un nouveau jeu
 const addGame = async () => {
   if (!storage.value || !newGameTitle.value || !newGameEditor.value || !newGameRelease.value) {
-    alert('Veuillez remplir tous les champs obligatoires !')
+    alert('Veuillez remplir tous les champs obligatoires')
     return
   }
 
@@ -88,7 +124,7 @@ const addGame = async () => {
     newGameRelease.value = null
     fetchData()
   } catch (error) {
-    console.error("Erreur lors de l'ajout du jeu :", error)
+    console.error("Erreur lors de l'ajout du jeu:", error)
   }
 }
 
@@ -124,7 +160,7 @@ const saveEdit = async () => {
     !editGameEditor.value ||
     !editGameRelease.value
   ) {
-    alert('Veuillez remplir tous les champs obligatoires !')
+    alert('Veuillez remplir tous les champs obligatoires')
     return
   }
 
@@ -152,7 +188,7 @@ const saveEdit = async () => {
     cancelEdit()
     fetchData()
   } catch (error) {
-    console.error('Erreur lors de la modification du jeu :', error)
+    console.error('Erreur lors de la modification du jeu:', error)
   }
 }
 
@@ -161,15 +197,15 @@ const deleteGame = async (game: Game) => {
   if (!storage.value) return
 
   const gameTitle = game.biblio?.games?.[0]?.title || 'ce jeu'
-  const confirmDelete = confirm(`Êtes-vous sûr de vouloir supprimer "${gameTitle}" ?`)
+  const confirmDelete = confirm(`Êtes-vous sûr de vouloir supprimer "${gameTitle}"?`)
   if (!confirmDelete) return
 
   try {
     await storage.value.remove(game._id, game._rev!)
-    console.log('Jeu supprimé avec succès !')
+    console.log('Jeu supprimé avec succès')
     fetchData()
   } catch (error) {
-    console.error('Erreur lors de la suppression du jeu :', error)
+    console.error('Erreur lors de la suppression du jeu:', error)
   }
 }
 
