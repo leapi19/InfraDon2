@@ -1,11 +1,15 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import PouchDB from 'pouchdb'
+import PouchFind from 'pouchdb-find'
+
+PouchDB.plugin(PouchFind)
 
 // Interface pour un jeu
-declare interface Game {
+interface Game {
   _id: string
   _rev?: string
+  title: string
   biblio: {
     games: Array<{
       title: string
@@ -36,73 +40,89 @@ const editGameEditor = ref('')
 const editGameCountry = ref('')
 const editGameRelease = ref<number | null>(null)
 
-// Initialisation de la base de données
-const initDatabase = () => {
-  const localDB = new PouchDB('database-infradon') // on se connecte et après on peut manipuler les objets
+const searchTitle = ref('')
+
+const remoteURL = 'http://admin:admin@localhost:5984/database-infradon'
+
+// --- Initialisation de la base ---
+const initDatabase = async () => {
+  const localDB = new PouchDB('database-infradon')
   storage.value = localDB
-  console.log('Connecté à la collection: ' + localDB.name)
+  console.log('Connecté à la base : ' + localDB.name)
 
-  // 'http://admin:admin@localhost:5984/database-infradon'
-
-  localDB.replicate
-    .from('http://admin:admin@localhost:5984/database-infradon')
-    .on('complete', () => {
-      fetchData()
-    })
-    .on('error', (err) => {
-      console.error('Erreur lors de la réplication initiale:', err)
-    })
-  //push
-  localDB.replicate
-    .to('http://admin:admin@localhost:5984/database-infradon', {
-      live: true,
-      retry: true,
-    })
-    .on('change', (info) => {
-      console.log('↑ Changement envoyé vers distant:', info)
-    })
-    .on('error', (err) => {
-      console.error('✗ Erreur de réplication TO:', err)
-    })
-
-  //pull
-  localDB.replicate
-    .from('http://admin:admin@localhost:5984/database-infradon', {
-      live: true,
-      retry: true,
-    })
-    .on('change', (info) => {
-      console.log('Changement reçu du distant:', info)
-      fetchData()
-    })
-    .on('error', (err) => {
-      console.error('Erreur de réplication FROM:', err)
-    })
+  // Création d’un index sur le champ "title" à la racine
+  await localDB.createIndex({
+    index: {
+      fields: ['title'],
+      name: 'index-title',
+      ddoc: 'index-title-doc',
+    },
+  })
+  console.log("Index 'title' créé ✔")
 }
 
-// Récupération des données
+// --- Réplication ---
+const replicateFromDistant = () => {
+  if (!storage.value) return
+  console.log('Réplication FROM distante')
+  storage.value.replicate
+    .from(remoteURL)
+    .on('complete', () => {
+      console.log('Réplication FROM terminée')
+      fetchData()
+    })
+    .on('error', (err) => console.error('Erreur réplication FROM :', err))
+}
+
+const replicateToDistant = () => {
+  if (!storage.value) return
+  console.log('↗️ Réplication TO distante')
+  storage.value.replicate
+    .to(remoteURL)
+    .on('complete', () => console.log('✔ Réplication TO terminée'))
+    .on('error', (err) => console.error('✗ Erreur réplication TO :', err))
+}
+
+// --- Récupération des données ---
 const fetchData = async () => {
   if (!storage.value) return
   try {
     const result = await storage.value.allDocs({ include_docs: true })
-    gamesData.value = result.rows
-      .map((row) => row.doc as Game)
-      .filter((doc) => doc.biblio && doc.biblio.games)
+    gamesData.value = result.rows.map((row) => row.doc as Game).filter((doc) => doc && doc.title)
     console.log('Données récupérées :', gamesData.value)
-  } catch (error) {
-    console.error('Erreur lors de la récupération des données:', error)
+  } catch (err) {
+    console.error('Erreur fetchData :', err)
   }
 }
 
-// Ajout d'un nouveau jeu
+// --- Recherche indexée ---
+const searchByTitle = async () => {
+  if (!storage.value) return
+  if (!searchTitle.value.trim()) {
+    fetchData()
+    return
+  }
+  try {
+    const result = await storage.value.find({
+      selector: { title: { $regex: RegExp(searchTitle.value, 'i') } },
+      use_index: 'index-title-doc',
+    })
+    gamesData.value = result.docs as Game[]
+    console.log('Résultats filtrés :', gamesData.value)
+  } catch (err) {
+    console.error('Erreur recherche indexée :', err)
+  }
+}
+
+// --- Ajout ---
 const addGame = async () => {
   if (!storage.value || !newGameTitle.value || !newGameEditor.value || !newGameRelease.value) {
     alert('Veuillez remplir tous les champs obligatoires')
     return
   }
-
-  const gameObj = {
+  const gameObj: Game = {
     _id: `game_${Date.now()}`,
+    title: newGameTitle.value,
     biblio: {
       games: [
         {
@@ -113,35 +133,32 @@ const addGame = async () => {
         },
       ],
     },
-  } as Game
-
+  }
   try {
     await storage.value.put(gameObj)
-    console.log('Jeu ajouté avec succès !')
+    console.log('Jeu ajouté ✔')
     newGameTitle.value = ''
     newGameEditor.value = ''
     newGameCountry.value = ''
     newGameRelease.value = null
     fetchData()
-  } catch (error) {
-    console.error("Erreur lors de l'ajout du jeu:", error)
+  } catch (err) {
+    console.error('Erreur ajout :', err)
   }
 }
 
-// Préparer la modification d'un jeu
+// --- Modification ---
 const startEdit = (game: Game) => {
-  const gameData = game.biblio?.games?.[0]
-  if (!gameData) return
-
+  const g = game.biblio.games[0]
+  if (!g) return
   editMode.value = true
   editingGameId.value = game._id
-  editGameTitle.value = gameData.title
-  editGameEditor.value = gameData.editor
-  editGameCountry.value = gameData.country || ''
-  editGameRelease.value = gameData.release
+  editGameTitle.value = g.title
+  editGameEditor.value = g.editor
+  editGameCountry.value = g.country || ''
+  editGameRelease.value = g.release
 }
 
-// Annuler la modification
 const cancelEdit = () => {
   editMode.value = false
   editingGameId.value = null
@@ -151,7 +168,6 @@ const cancelEdit = () => {
   editGameRelease.value = null
 }
 
-// Sauvegarder les modifications
 const saveEdit = async () => {
   if (
     !storage.value ||
@@ -163,14 +179,11 @@ const saveEdit = async () => {
     alert('Veuillez remplir tous les champs obligatoires')
     return
   }
-
   try {
-    // Récupérer le document actuel pour obtenir le _rev
     const doc = (await storage.value.get(editingGameId.value)) as Game
-
-    // Mettre à jour le document
-    const updatedGame = {
+    const updated: Game = {
       ...doc,
+      title: editGameTitle.value,
       biblio: {
         games: [
           {
@@ -182,112 +195,127 @@ const saveEdit = async () => {
         ],
       },
     }
-
-    await storage.value.put(updatedGame)
-    console.log('Jeu modifié avec succès !')
+    await storage.value.put(updated)
+    console.log('Jeu modifié ✔')
     cancelEdit()
     fetchData()
-  } catch (error) {
-    console.error('Erreur lors de la modification du jeu:', error)
+  } catch (err) {
+    console.error('Erreur modification :', err)
   }
 }
 
-// Supprimer un jeu
+// --- Suppression ---
 const deleteGame = async (game: Game) => {
   if (!storage.value) return
-
-  const gameTitle = game.biblio?.games?.[0]?.title || 'ce jeu'
-  const confirmDelete = confirm(`Êtes-vous sûr de vouloir supprimer "${gameTitle}"?`)
-  if (!confirmDelete) return
-
+  if (!confirm(`Supprimer "${game.title}" ?`)) return
   try {
     await storage.value.remove(game._id, game._rev!)
-    console.log('Jeu supprimé avec succès')
+    console.log('Jeu supprimé ✔')
     fetchData()
-  } catch (error) {
-    console.error('Erreur lors de la suppression du jeu:', error)
+  } catch (err) {
+    console.error('Erreur suppression :', err)
   }
 }
 
-onMounted(() => {
+// --- Factory pour générer des jeux ---
+const generateGames = async (count: number) => {
+  if (!storage.value) return
+  const docs: Game[] = []
+  for (let i = 0; i < count; i++) {
+    docs.push({
+      _id: `game_${Date.now()}_${i}`,
+      title: `Game ${i}`,
+      biblio: {
+        games: [{ title: `Game ${i}`, editor: `Editor ${i}`, release: 2000 + (i % 20) }],
+      },
+    })
+  }
+  await storage.value.bulkDocs(docs)
+  console.log(`${count} jeux générés ✔`)
+  fetchData()
+}
+
+onMounted(async () => {
   console.log('=> Composant initialisé')
-  initDatabase()
+  await initDatabase()
   fetchData()
 })
 </script>
 
 <template>
-  <h1>Games List</h1>
+  <h1>Liste des jeux</h1>
+
+  <!-- Recherche -->
+  <div style="margin-bottom: 20px">
+    <input v-model="searchTitle" placeholder="Recherche par titre..." />
+    <button @click="searchByTitle">Rechercher</button>
+    <button
+      @click="
+        () => {
+          searchTitle = ''
+          fetchData()
+        }
+      "
+    >
+      Réinitialiser
+    </button>
+  </div>
+
+  <!-- Réplication -->
+  <div style="margin-bottom: 20px">
+    <button @click="replicateFromDistant">Replicate FROM</button>
+    <button @click="replicateToDistant">Replicate TO</button>
+  </div>
+
+  <!-- Factory -->
+  <div style="margin-bottom: 20px">
+    <button @click="generateGames(50)">Générer 50 jeux</button>
+  </div>
 
   <!-- Formulaire d'ajout -->
   <div v-if="!editMode">
-    <h2>Ajouter un nouveau jeu</h2>
+    <h2>Ajouter un jeu</h2>
     <form @submit.prevent="addGame">
+      <div><label>Titre: </label><input v-model="newGameTitle" required /></div>
+      <div><label>Éditeur: </label><input v-model="newGameEditor" required /></div>
+      <div><label>Pays: </label><input v-model="newGameCountry" /></div>
       <div>
-        <label>Titre : </label>
-        <input v-model="newGameTitle" required />
+        <label>Année: </label><input type="number" v-model.number="newGameRelease" required />
       </div>
-      <div>
-        <label>Éditeur : </label>
-        <input v-model="newGameEditor" required />
-      </div>
-      <div>
-        <label>Pays : </label>
-        <input v-model="newGameCountry" />
-      </div>
-      <div>
-        <label>Année de sortie : </label>
-        <input type="number" v-model.number="newGameRelease" required />
-      </div>
-      <button type="submit">Ajouter le jeu</button>
+      <button type="submit">Ajouter</button>
     </form>
   </div>
 
-  <!-- Formulaire de modification -->
+  <!-- Formulaire modification -->
   <div v-if="editMode">
     <h2>Modifier le jeu</h2>
     <form @submit.prevent="saveEdit">
+      <div><label>Titre: </label><input v-model="editGameTitle" required /></div>
+      <div><label>Éditeur: </label><input v-model="editGameEditor" required /></div>
+      <div><label>Pays: </label><input v-model="editGameCountry" /></div>
       <div>
-        <label>Titre : </label>
-        <input v-model="editGameTitle" required />
-      </div>
-      <div>
-        <label>Éditeur : </label>
-        <input v-model="editGameEditor" required />
-      </div>
-      <div>
-        <label>Pays : </label>
-        <input v-model="editGameCountry" />
-      </div>
-      <div>
-        <label>Année de sortie : </label>
-        <input type="number" v-model.number="editGameRelease" required />
+        <label>Année: </label><input type="number" v-model.number="editGameRelease" required />
       </div>
       <button type="submit">Sauvegarder</button>
-      <button type="button" @click="cancelEdit" style="margin-left: 10px">Annuler</button>
+      <button type="button" @click="cancelEdit">Annuler</button>
     </form>
   </div>
 
-  <!-- Liste des jeux -->
+  <!-- Liste -->
   <div
     v-for="game in gamesData"
     :key="game._id"
-    style="margin-top: 20px; border: 1px solid #ccc; padding: 10px"
+    style="margin-top: 10px; border: 1px solid #ccc; padding: 10px"
   >
-    <div v-for="(g, index) in game.biblio.games" :key="index">
+    <div v-for="(g, i) in game.biblio.games" :key="i">
       <h2>{{ g.title }}</h2>
-      <p>Éditeur : {{ g.editor }}</p>
-      <p v-if="g.country">Pays : {{ g.country }}</p>
-      <p>Année de sortie : {{ g.release }}</p>
-      <div style="margin-top: 10px">
-        <button @click="startEdit(game)" :disabled="editMode">Modifier</button>
-        <button
-          @click="deleteGame(game)"
-          style="margin-left: 10px; background-color: #dc3545; color: white"
-        >
-          Supprimer
-        </button>
-      </div>
+      <p>Éditeur: {{ g.editor }}</p>
+      <p v-if="g.country">Pays: {{ g.country }}</p>
+      <p>Année: {{ g.release }}</p>
+      <button @click="startEdit(game)" :disabled="editMode">Modifier</button>
+      <button @click="deleteGame(game)" style="margin-left: 10px; color: white; background: red">
+        Supprimer
+      </button>
     </div>
   </div>
 </template>
