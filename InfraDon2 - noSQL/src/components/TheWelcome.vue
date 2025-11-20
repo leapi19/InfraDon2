@@ -61,7 +61,7 @@ const initDatabase = async () => {
   console.log("Index 'title' créé ✔")
 }
 
-// --- Réplication ---
+// --- Réplication -- -
 const replicateFromDistant = () => {
   if (!storage.value) return
   console.log('Réplication FROM distante')
