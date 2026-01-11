@@ -5,10 +5,11 @@ import PouchFind from 'pouchdb-find'
 
 PouchDB.plugin(PouchFind)
 
-// Interface pour un jeu mise à jour avec likes et commentaires
+// Interface pour un jeu (sans les commentaires intégrés)
 interface Game {
   _id: string
   _rev?: string
+  type: 'game'
   title: string
   biblio: {
     games: Array<{
@@ -19,21 +20,29 @@ interface Game {
     }>
   }
   likes: number
-  comments: Array<{
-    author: string
-    content: string
-    date: number
-  }>
   _attachments?: PouchDB.Core.Attachments
 }
 
-// Référence à la base de données
-const storage = ref<PouchDB.Database>()
+// Interface pour un commentaire (collection séparée)
+interface Comment {
+  _id: string
+  _rev?: string
+  type: 'comment'
+  gameId: string
+  author: string
+  content: string
+  createdAt: number
+}
 
-// Données stockées (liste de jeux)
+// Référence aux bases de données
+const gamesDB = ref<PouchDB.Database>()
+const commentsDB = ref<PouchDB.Database>()
+
+// Données stockées
 const gamesData = ref<Game[]>([])
+const commentsData = ref<Comment[]>([])
 
-// Champs pour le formulaire d'ajout
+// Champs pour le formulaire d'ajout de jeu
 const newGameTitle = ref('')
 const newGameEditor = ref('')
 const newGameCountry = ref('')
@@ -56,8 +65,8 @@ const newCommentContent = ref('')
 
 // État pour la modification d'un commentaire
 const editingComment = ref<{
+  commentId: string
   gameId: string
-  date: number
   content: string
   author: string
 } | null>(null)
@@ -74,52 +83,89 @@ const showOnlyTop10 = ref(false)
 // Pour gérer les URLs des images attachées
 const attachmentUrls = ref<{ [gameId: string]: string }>({})
 
-const remoteURL = 'http://admin:admin@localhost:5984/database-infradon'
+const remoteURL = 'http://admin:admin@localhost:5984'
 
-// --- Initialisation de la base ---
+// --- Initialisation des bases ---
 const initDatabase = async () => {
-  const localDB = new PouchDB('database-infradon')
-  storage.value = localDB
-  console.log('Connecté à la base : ' + localDB.name)
+  // Base de données pour les jeux
+  const localGamesDB = new PouchDB('games-collection')
+  gamesDB.value = localGamesDB
+  console.log('Connecté à la collection jeux : ' + localGamesDB.name)
 
-  await localDB.createIndex({
+  // Base de données pour les commentaires
+  const localCommentsDB = new PouchDB('comments-collection')
+  commentsDB.value = localCommentsDB
+  console.log('Connecté à la collection commentaires : ' + localCommentsDB.name)
+
+  // Index pour la collection jeux
+  await localGamesDB.createIndex({
     index: {
-      fields: ['title'],
-      name: 'index-title',
-      ddoc: 'index-title-doc',
+      fields: ['type', 'title'],
+      name: 'index-games-title',
+      ddoc: 'index-games-title-doc',
     },
   })
 
-  await localDB.createIndex({
+  await localGamesDB.createIndex({
     index: {
-      fields: ['likes'],
-      name: 'index-likes',
-      ddoc: 'index-likes-doc',
+      fields: ['type', 'likes'],
+      name: 'index-games-likes',
+      ddoc: 'index-games-likes-doc',
     },
   })
-  console.log("Index 'title' et 'likes' créés ✔")
+
+  // Index pour la collection commentaires
+  await localCommentsDB.createIndex({
+    index: {
+      fields: ['type', 'gameId'],
+      name: 'index-comments-gameid',
+      ddoc: 'index-comments-gameid-doc',
+    },
+  })
+
+  console.log('Index créés ✔')
 }
 
 // --- Réplication ---
 const replicateFromDistant = () => {
-  if (!storage.value) return
+  if (!gamesDB.value || !commentsDB.value) return
+
   console.log('Réplication FROM distante')
-  storage.value.replicate
-    .from(remoteURL)
+
+  // Répliquer les jeux
+  gamesDB.value.replicate
+    .from(`${remoteURL}/games-collection`)
     .on('complete', () => {
-      console.log('Réplication FROM terminée')
+      console.log('Réplication jeux FROM terminée')
+    })
+    .on('error', (err) => console.error('Erreur réplication jeux FROM :', err))
+
+  // Répliquer les commentaires
+  commentsDB.value.replicate
+    .from(`${remoteURL}/comments-collection`)
+    .on('complete', () => {
+      console.log('Réplication commentaires FROM terminée')
       fetchData()
     })
-    .on('error', (err) => console.error('Erreur réplication FROM :', err))
+    .on('error', (err) => console.error('Erreur réplication commentaires FROM :', err))
 }
 
 const replicateToDistant = () => {
-  if (!storage.value) return
+  if (!gamesDB.value || !commentsDB.value) return
+
   console.log('↗️ Réplication TO distante')
-  storage.value.replicate
-    .to(remoteURL)
-    .on('complete', () => console.log('✔ Réplication TO terminée'))
-    .on('error', (err) => console.error('✗ Erreur réplication TO :', err))
+
+  // Répliquer les jeux
+  gamesDB.value.replicate
+    .to(`${remoteURL}/games-collection`)
+    .on('complete', () => console.log('✔ Réplication jeux TO terminée'))
+    .on('error', (err) => console.error('✗ Erreur réplication jeux TO :', err))
+
+  // Répliquer les commentaires
+  commentsDB.value.replicate
+    .to(`${remoteURL}/comments-collection`)
+    .on('complete', () => console.log('✔ Réplication commentaires TO terminée'))
+    .on('error', (err) => console.error('✗ Erreur réplication commentaires TO :', err))
 }
 
 // --- Tri Côté Client ---
@@ -147,16 +193,13 @@ const toggleShowAllComments = (gameId: string) => {
 }
 
 // Obtenir les commentaires à afficher (premier ou tous)
-const getCommentsToDisplay = (
-  game: Game,
-): Array<{ author: string; content: string; date: number }> => {
-  if (showAllComments.value[game._id]) {
-    return (game.comments || []).filter(
-      (c): c is { author: string; content: string; date: number } => !!c,
-    )
+const getCommentsToDisplay = (gameId: string): Comment[] => {
+  const comments = commentsData.value.filter((c) => c.gameId === gameId)
+
+  if (showAllComments.value[gameId]) {
+    return comments
   }
-  const firstComment = game.comments && game.comments.length > 0 ? game.comments[0] : null
-  return firstComment ? [firstComment] : []
+  return comments.length > 0 ? [comments[0]] : []
 }
 
 // Filtrer pour n'afficher que les 10 jeux les plus likés
@@ -169,28 +212,37 @@ const getGamesToDisplay = () => {
 
 // --- Récupération des données ---
 const fetchData = async () => {
-  if (!storage.value) return
+  if (!gamesDB.value || !commentsDB.value) return
   try {
-    const result = await storage.value.allDocs({ include_docs: true })
-    gamesData.value = result.rows
-      .map((row) => {
-        const doc = row.doc as Game
-        if (doc && doc.title) {
-          doc.likes = doc.likes ?? 0
-          doc.comments = doc.comments ?? []
-          return doc
-        }
-        return null
-      })
-      .filter((doc): doc is Game => doc !== null)
+    // Récupérer les jeux
+    const gamesResult = await gamesDB.value.find({
+      selector: { type: 'game' },
+    })
+    gamesData.value = gamesResult.docs.map((doc) => {
+      const game = doc as Game
+      game.likes = game.likes ?? 0
+      return game
+    })
     applySort()
+
+    // Récupérer les commentaires
+    const commentsResult = await commentsDB.value.find({
+      selector: { type: 'comment' },
+    })
+    commentsData.value = commentsResult.docs as Comment[]
 
     // Charger les attachments pour chaque jeu
     for (const game of gamesData.value) {
       await loadAttachment(game)
     }
 
-    console.log('Données récupérées :', gamesData.value.length)
+    console.log(
+      'Données récupérées :',
+      gamesData.value.length,
+      'jeux,',
+      commentsData.value.length,
+      'commentaires',
+    )
   } catch (err) {
     console.error('Erreur fetchData :', err)
   }
@@ -198,20 +250,22 @@ const fetchData = async () => {
 
 // --- Recherche indexée ---
 const searchByTitle = async () => {
-  if (!storage.value) return
+  if (!gamesDB.value) return
   if (!searchTitle.value.trim()) {
     fetchData()
     return
   }
   try {
-    const result = await storage.value.find({
-      selector: { title: { $regex: RegExp(searchTitle.value, 'i') } },
-      use_index: 'index-title-doc',
+    const result = await gamesDB.value.find({
+      selector: {
+        type: 'game',
+        title: { $regex: RegExp(searchTitle.value, 'i') },
+      },
+      use_index: 'index-games-title-doc',
     })
     gamesData.value = result.docs.map((doc) => {
       const game = doc as Game
       game.likes = game.likes ?? 0
-      game.comments = game.comments ?? []
       return game
     })
     applySort()
@@ -223,12 +277,13 @@ const searchByTitle = async () => {
 
 // --- Ajout ---
 const addGame = async () => {
-  if (!storage.value || !newGameTitle.value || !newGameEditor.value || !newGameRelease.value) {
+  if (!gamesDB.value || !newGameTitle.value || !newGameEditor.value || !newGameRelease.value) {
     alert('Veuillez remplir tous les champs obligatoires')
     return
   }
   const gameObj: Omit<Game, '_attachments'> = {
     _id: `game_${Date.now()}`,
+    type: 'game',
     title: newGameTitle.value,
     biblio: {
       games: [
@@ -241,10 +296,9 @@ const addGame = async () => {
       ],
     },
     likes: 0,
-    comments: [],
   }
   try {
-    await storage.value.put(gameObj)
+    await gamesDB.value.put(gameObj)
     console.log('Jeu ajouté ✔')
     newGameTitle.value = ''
     newGameEditor.value = ''
@@ -280,7 +334,7 @@ const cancelEdit = () => {
 
 const saveEdit = async () => {
   if (
-    !storage.value ||
+    !gamesDB.value ||
     !editingGameId.value ||
     !editGameTitle.value ||
     !editGameEditor.value ||
@@ -290,13 +344,14 @@ const saveEdit = async () => {
     return
   }
   try {
-    const doc = (await storage.value.get(editingGameId.value)) as Game
+    const doc = (await gamesDB.value.get(editingGameId.value)) as Game
     const updated: Omit<Game, '_attachments'> & {
       _rev: string
       _attachments?: PouchDB.Core.Attachments
     } = {
       ...doc,
       _rev: doc._rev!,
+      type: 'game',
       title: editGameTitle.value,
       biblio: {
         games: [
@@ -309,7 +364,7 @@ const saveEdit = async () => {
         ],
       },
     }
-    await storage.value.put(updated)
+    await gamesDB.value.put(updated)
     console.log('Jeu modifié ✔')
     cancelEdit()
     fetchData()
@@ -320,10 +375,17 @@ const saveEdit = async () => {
 
 // --- Suppression du jeu ---
 const deleteGame = async (game: Game) => {
-  if (!storage.value) return
+  if (!gamesDB.value || !commentsDB.value) return
   if (!confirm(`Supprimer "${game.title}" ?`)) return
   try {
-    await storage.value.remove(game._id, game._rev!)
+    // Supprimer tous les commentaires associés
+    const comments = commentsData.value.filter((c) => c.gameId === game._id)
+    for (const comment of comments) {
+      await commentsDB.value.remove(comment._id, comment._rev!)
+    }
+
+    // Supprimer le jeu
+    await gamesDB.value.remove(game._id, game._rev!)
     console.log('Jeu supprimé ✔')
     fetchData()
   } catch (err) {
@@ -333,15 +395,19 @@ const deleteGame = async (game: Game) => {
 
 // --- Liker un jeu ---
 const likeGame = async (game: Game) => {
-  if (!storage.value) return
+  if (!gamesDB.value) return
   try {
-    const doc = (await storage.value.get(game._id)) as Game
-    const updated: Game = {
+    const doc = (await gamesDB.value.get(game._id)) as Game
+    const updated: Omit<Game, '_attachments'> & {
+      _rev: string
+      _attachments?: PouchDB.Core.Attachments
+    } = {
       ...doc,
-      _rev: doc._rev,
+      _rev: doc._rev!,
+      type: 'game',
       likes: (doc.likes || 0) + 1,
     }
-    await storage.value.put(updated)
+    await gamesDB.value.put(updated)
     console.log('Jeu liké ✔')
     fetchData()
   } catch (err) {
@@ -350,24 +416,21 @@ const likeGame = async (game: Game) => {
 }
 
 // --- Ajouter un commentaire ---
-const addComment = async (game: Game) => {
-  if (!storage.value || !newCommentAuthor.value.trim() || !newCommentContent.value.trim()) {
+const addComment = async (gameId: string) => {
+  if (!commentsDB.value || !newCommentAuthor.value.trim() || !newCommentContent.value.trim()) {
     alert('Veuillez remplir votre nom et le commentaire.')
     return
   }
   try {
-    const doc = (await storage.value.get(game._id)) as Game
-    const newComment = {
+    const comment: Comment = {
+      _id: `comment_${Date.now()}`,
+      type: 'comment',
+      gameId: gameId,
       author: newCommentAuthor.value,
       content: newCommentContent.value,
-      date: Date.now(),
+      createdAt: Date.now(),
     }
-    const updated: Game = {
-      ...doc,
-      _rev: doc._rev,
-      comments: [...(doc.comments || []), newComment],
-    }
-    await storage.value.put(updated)
+    await commentsDB.value.put(comment)
     console.log('Commentaire ajouté ✔')
     newCommentAuthor.value = ''
     newCommentContent.value = ''
@@ -378,16 +441,10 @@ const addComment = async (game: Game) => {
 }
 
 // --- Suppression d'un commentaire ---
-const deleteComment = async (game: Game, commentDate: number) => {
-  if (!storage.value || !confirm('Supprimer ce commentaire ?')) return
+const deleteComment = async (comment: Comment) => {
+  if (!commentsDB.value || !confirm('Supprimer ce commentaire ?')) return
   try {
-    const doc = (await storage.value.get(game._id)) as Game
-    const updated: Game = {
-      ...doc,
-      _rev: doc._rev,
-      comments: (doc.comments || []).filter((c) => c.date !== commentDate),
-    }
-    await storage.value.put(updated)
+    await commentsDB.value.remove(comment._id, comment._rev!)
     console.log('Commentaire supprimé ✔')
     fetchData()
   } catch (err) {
@@ -396,13 +453,13 @@ const deleteComment = async (game: Game, commentDate: number) => {
 }
 
 // --- Modification d'un commentaire ---
-const startEditComment = (game: Game, c: Game['comments'][number]) => {
+const startEditComment = (comment: Comment) => {
   if (editMode.value) return alert('Veuillez finir la modification du jeu en cours.')
   editingComment.value = {
-    gameId: game._id,
-    date: c.date,
-    content: c.content,
-    author: c.author,
+    commentId: comment._id,
+    gameId: comment.gameId,
+    content: comment.content,
+    author: comment.author,
   }
 }
 
@@ -411,24 +468,18 @@ const cancelEditComment = () => {
 }
 
 const saveEditComment = async () => {
-  if (!storage.value || !editingComment.value || !editingComment.value.content.trim()) return
+  if (!commentsDB.value || !editingComment.value || !editingComment.value.content.trim()) return
 
   try {
-    const doc = (await storage.value.get(editingComment.value.gameId)) as Game
-    const updatedComments = (doc.comments || []).map((c) => {
-      if (c.date === editingComment.value!.date) {
-        return { ...c, content: editingComment.value!.content }
-      }
-      return c
-    })
-
-    const updated: Game = {
+    const doc = (await commentsDB.value.get(editingComment.value.commentId)) as Comment
+    const updated: Comment = {
       ...doc,
-      _rev: doc._rev,
-      comments: updatedComments,
+      _rev: doc._rev!,
+      type: 'comment',
+      content: editingComment.value.content,
     }
 
-    await storage.value.put(updated)
+    await commentsDB.value.put(updated)
     console.log('Commentaire modifié ✔')
     cancelEditComment()
     fetchData()
@@ -439,20 +490,18 @@ const saveEditComment = async () => {
 
 // --- Gestion des attachments (médias) ---
 const loadAttachment = async (game: Game) => {
-  if (!storage.value) return
+  if (!gamesDB.value) return
 
-  // Nettoyer l'ancienne URL si elle existe
   const oldUrl = attachmentUrls.value[game._id]
   if (oldUrl) {
     URL.revokeObjectURL(oldUrl)
   }
 
   try {
-    // Vérifier si le jeu a un attachment
     if (game._attachments && Object.keys(game._attachments).length > 0) {
       const attachmentName = Object.keys(game._attachments)[0]
       if (attachmentName) {
-        const blob = (await storage.value.getAttachment(
+        const blob = (await gamesDB.value.getAttachment(
           game._id,
           attachmentName,
         )) as unknown as Blob
@@ -465,24 +514,22 @@ const loadAttachment = async (game: Game) => {
 }
 
 const addAttachment = async (game: Game, event: Event) => {
-  if (!storage.value) return
+  if (!gamesDB.value) return
 
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
 
   if (!file) return
 
-  // Vérifier que c'est bien une image
   if (!file.type.startsWith('image/')) {
     alert('Veuillez sélectionner une image')
     return
   }
 
   try {
-    const doc = (await storage.value.get(game._id)) as Game
+    const doc = (await gamesDB.value.get(game._id)) as Game
 
-    // Ajouter l'attachment
-    await storage.value.putAttachment(game._id, 'media', doc._rev!, file, file.type)
+    await gamesDB.value.putAttachment(game._id, 'media', doc._rev!, file, file.type)
 
     console.log('Media ajouté ✔')
     fetchData()
@@ -492,20 +539,18 @@ const addAttachment = async (game: Game, event: Event) => {
 }
 
 const deleteAttachment = async (game: Game) => {
-  if (!storage.value) return
+  if (!gamesDB.value) return
   if (!confirm('Supprimer le média ?')) return
 
   try {
-    const doc = (await storage.value.get(game._id)) as Game
+    const doc = (await gamesDB.value.get(game._id)) as Game
 
     if (doc._attachments && Object.keys(doc._attachments).length > 0) {
       const attachmentName = Object.keys(doc._attachments)[0]
 
       if (attachmentName && doc._rev) {
-        // Supprimer l'attachment
-        await storage.value.removeAttachment(game._id, attachmentName, doc._rev)
+        await gamesDB.value.removeAttachment(game._id, attachmentName, doc._rev)
 
-        // Nettoyer l'URL
         const oldUrl = attachmentUrls.value[game._id]
         if (oldUrl) {
           URL.revokeObjectURL(oldUrl)
@@ -521,6 +566,11 @@ const deleteAttachment = async (game: Game) => {
   }
 }
 
+// Obtenir le nombre de commentaires pour un jeu
+const getCommentsCount = (gameId: string): number => {
+  return commentsData.value.filter((c) => c.gameId === gameId).length
+}
+
 onMounted(async () => {
   console.log('=> Composant initialisé')
   await initDatabase()
@@ -529,7 +579,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <h1>Liste des jeux</h1>
+  <h1>🎮 Liste des jeux - 2 Collections</h1>
 
   <!-- Recherche -->
   <div style="margin-bottom: 20px">
@@ -580,61 +630,56 @@ onMounted(async () => {
 
   <!-- Réplication -->
   <div style="margin-bottom: 20px">
-    <button @click="replicateFromDistant">Replicate FROM</button>
-    <button @click="replicateToDistant">Replicate TO</button>
+    <button @click="replicateFromDistant">⬇️ Replicate FROM</button>
+    <button @click="replicateToDistant">⬆️ Replicate TO</button>
   </div>
 
   <hr />
 
   <!-- Formulaire modification commentaire -->
   <div v-if="editingComment" class="edit-comment-form">
-    <h3>
-      ✏️ Modifier un commentaire sur "{{
-        gamesData.find((g) => g._id === editingComment?.gameId)?.title
-      }}"
-    </h3>
-    <p>Auteur: **{{ editingComment.author }}**</p>
-    <form @submit.prevent="saveEditComment">
-      <textarea
-        v-model="editingComment.content"
-        rows="4"
-        cols="50"
-        required
-        style="width: 100%"
-      ></textarea>
-      <br />
-      <button type="submit">Sauvegarder Commentaire</button>
-      <button type="button" @click="cancelEditComment" style="margin-left: 10px">Annuler</button>
-    </form>
+    <h3>✏️ Modifier un commentaire</h3>
+    <p>
+      Auteur: <strong>{{ editingComment.author }}</strong>
+    </p>
+    <textarea
+      v-model="editingComment.content"
+      rows="4"
+      required
+      style="width: 100%; padding: 10px; margin: 10px 0"
+    ></textarea>
+    <br />
+    <button @click="saveEditComment">Sauvegarder</button>
+    <button @click="cancelEditComment" style="margin-left: 10px">Annuler</button>
   </div>
 
   <!-- Formulaire ajout jeu -->
   <div v-if="!editMode && !editingComment">
     <h2>Ajouter un jeu</h2>
-    <form @submit.prevent="addGame">
+    <div>
       <div><label>Titre: </label><input v-model="newGameTitle" required /></div>
       <div><label>Éditeur: </label><input v-model="newGameEditor" required /></div>
       <div><label>Pays: </label><input v-model="newGameCountry" /></div>
       <div>
         <label>Année: </label><input type="number" v-model.number="newGameRelease" required />
       </div>
-      <button type="submit">Ajouter</button>
-    </form>
+      <button @click="addGame">Ajouter</button>
+    </div>
   </div>
 
   <!-- Formulaire modification jeu -->
   <div v-if="editMode">
     <h2>Modifier le jeu</h2>
-    <form @submit.prevent="saveEdit">
+    <div>
       <div><label>Titre: </label><input v-model="editGameTitle" required /></div>
       <div><label>Éditeur: </label><input v-model="editGameEditor" required /></div>
       <div><label>Pays: </label><input v-model="editGameCountry" /></div>
       <div>
         <label>Année: </label><input type="number" v-model.number="editGameRelease" required />
       </div>
-      <button type="submit">Sauvegarder</button>
-      <button type="button" @click="cancelEdit">Annuler</button>
-    </form>
+      <button @click="saveEdit">Sauvegarder</button>
+      <button @click="cancelEdit">Annuler</button>
+    </div>
   </div>
 
   <hr />
@@ -689,31 +734,29 @@ onMounted(async () => {
 
       <hr style="margin: 15px 0" />
 
-      <h4 class="comments-section">💬 Commentaires ({{ game.comments.length }})</h4>
+      <h4 class="comments-section">💬 Commentaires ({{ getCommentsCount(game._id) }})</h4>
 
-      <div v-if="game.comments.length">
-        <div v-for="c in getCommentsToDisplay(game)" :key="c?.date || 0" class="comment-item">
-          <template v-if="c">
-            <p class="comment-author">
-              {{ c.author }}
-              <span class="comment-date">({{ new Date(c.date).toLocaleDateString() }})</span>
-            </p>
-            <p class="comment-content">{{ c.content }}</p>
-            <button @click="startEditComment(game, c)" :disabled="editMode || !!editingComment">
-              Modifier
-            </button>
-            <button
-              @click="deleteComment(game, c.date)"
-              class="delete-comment-btn"
-              :disabled="editMode || !!editingComment"
-            >
-              Supprimer
-            </button>
-          </template>
+      <div v-if="getCommentsCount(game._id) > 0">
+        <div v-for="c in getCommentsToDisplay(game._id)" :key="c._id" class="comment-item">
+          <p class="comment-author">
+            {{ c.author }}
+            <span class="comment-date">({{ new Date(c.createdAt).toLocaleDateString() }})</span>
+          </p>
+          <p class="comment-content">{{ c.content }}</p>
+          <button @click="startEditComment(c)" :disabled="editMode || !!editingComment">
+            Modifier
+          </button>
+          <button
+            @click="deleteComment(c)"
+            class="delete-comment-btn"
+            :disabled="editMode || !!editingComment"
+          >
+            Supprimer
+          </button>
         </div>
 
         <!-- Bouton pour afficher tous les commentaires -->
-        <div v-if="game.comments.length > 1" style="margin-top: 10px">
+        <div v-if="getCommentsCount(game._id) > 1" style="margin-top: 10px">
           <button
             @click="toggleShowAllComments(game._id)"
             style="background: #17a2b8; color: white"
@@ -722,7 +765,7 @@ onMounted(async () => {
             {{
               showAllComments[game._id]
                 ? '▲ Masquer les commentaires'
-                : `▼ Afficher tous les commentaires (${game.comments.length})`
+                : `▼ Afficher tous les commentaires (${getCommentsCount(game._id)})`
             }}
           </button>
         </div>
@@ -732,7 +775,7 @@ onMounted(async () => {
 
       <div class="add-comment-form">
         <h5>Ajouter un commentaire</h5>
-        <form @submit.prevent="addComment(game)">
+        <div>
           <div>
             <label>Votre nom: </label
             ><input v-model="newCommentAuthor" required :disabled="editMode || !!editingComment" />
@@ -747,8 +790,10 @@ onMounted(async () => {
               :disabled="editMode || !!editingComment"
             ></textarea>
           </div>
-          <button type="submit" :disabled="editMode || !!editingComment">Poster</button>
-        </form>
+          <button @click="addComment(game._id)" :disabled="editMode || !!editingComment">
+            Poster
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -805,12 +850,12 @@ button:disabled {
   cursor: not-allowed;
 }
 
-button:not(.delete-btn):not(.delete-comment-btn) {
+button:not(.delete-btn):not(.delete-comment-btn):not(.delete-media-btn) {
   background-color: #007bff;
   color: white;
 }
 
-button:not(.delete-btn):not(.delete-comment-btn):hover {
+button:not(.delete-btn):not(.delete-comment-btn):not(.delete-media-btn):hover {
   background-color: #0056b3;
 }
 
@@ -834,11 +879,11 @@ button:not(.delete-btn):not(.delete-comment-btn):hover {
   background: #8b0000 !important;
 }
 
-form div {
+div > div {
   margin-bottom: 10px;
 }
 
-form label {
+label {
   display: inline-block;
   width: 100px;
   font-weight: 600;
@@ -850,7 +895,7 @@ form label {
   padding: 20px !important;
   border-radius: 8px;
   box-shadow: 0 4px 10px rgba(0, 0, 0, 0.05);
-  background-color: blueviolet !important;
+  background-color: #f0e6ff !important;
 }
 
 .game-card h2 {
@@ -864,7 +909,6 @@ form label {
   margin: 5px 0;
   font-size: 0.95em;
 }
-
 .comments-section {
   color: #6c757d;
   border-bottom: 1px solid #eee;
@@ -872,7 +916,6 @@ form label {
   margin-bottom: 15px;
   font-size: 1.1em;
 }
-
 .comment-item {
   border-left: 4px solid #17a2b8 !important;
   padding: 10px 15px !important;
@@ -880,23 +923,19 @@ form label {
   background: #f8f9fa !important;
   border-radius: 4px;
 }
-
 .comment-author {
   font-weight: bold;
   color: #17a2b8;
   margin: 0;
 }
-
 .comment-date {
   font-size: 0.8em;
   color: #6c757d;
 }
-
 .comment-content {
   margin: 5px 0 10px 0 !important;
   color: #333 !important;
 }
-
 .add-comment-form {
   margin-top: 20px;
   padding: 15px;
@@ -904,7 +943,6 @@ form label {
   background: #000000;
   border-radius: 6px;
 }
-
 .edit-comment-form {
   border: 2px solid #ffc107 !important;
   background: #fffbe6 !important;
@@ -912,18 +950,15 @@ form label {
   margin-bottom: 20px;
   border-radius: 8px;
 }
-
 .edit-comment-form h3 {
   color: #ffc107;
   border-bottom: 1px solid #ffc107;
   padding-bottom: 5px;
 }
-
 .media-container {
   margin: 15px 0;
   text-align: center;
 }
-
 .game-image {
   max-width: 100%;
   max-height: 300px;
@@ -931,7 +966,6 @@ form label {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
   margin-bottom: 10px;
 }
-
 .delete-media-btn {
   background: #dc3545 !important;
   color: white;
@@ -941,15 +975,12 @@ form label {
   cursor: pointer;
   font-weight: bold;
 }
-
 .delete-media-btn:hover:not(:disabled) {
   background: #c82333 !important;
 }
-
 .media-upload {
   margin: 15px 0;
 }
-
 .file-upload-label {
   display: inline-block;
   padding: 10px 20px;
@@ -960,11 +991,9 @@ form label {
   font-weight: bold;
   transition: background-color 0.2s;
 }
-
 .file-upload-label:hover {
   background: #218838;
 }
-
 .file-upload-label input[type='file']:disabled + label {
   opacity: 0.6;
   cursor: not-allowed;
